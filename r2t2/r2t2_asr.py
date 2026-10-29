@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Tuple, List, Optional, Union
 
 import numpy as np
@@ -185,6 +185,7 @@ class ASRStreamingState:
     chunk_text: List
     last_fixed_text: str
     _first_chunk_discarded: bool
+    chunk_sample_lengths: List[int] = field(default_factory=list)
 
 class R2T2ASRModel(Qwen3ASRModel):
     def __init__(
@@ -577,7 +578,47 @@ class R2T2ASRModel(Qwen3ASRModel):
         print(f"finish state.text={state.text}")
         return state.text
 
-    def streaming_transcribe_no_reset(
+    def _append_stream_audio(self, state, chunk):
+        """Trim audio and its text prefix at the SAME complete-chunk boundary.
+
+        An exact 8s cut isn't generally a chunk boundary (e.g. 480ms steps).
+        Track real chunk lengths, including the first lookahead and EOS tail,
+        rather than assuming every text entry represents 160ms.
+        """
+        lengths = state.chunk_sample_lengths
+        if len(lengths) != len(state.chunk_text) or sum(lengths) != len(state.audio_accum):
+            raise ValueError('Streaming audio/text window metadata differs')
+        state.audio_accum = np.concatenate((state.audio_accum, chunk))
+        if len(state.audio_accum) > 16 * SAMPLE_RATE:
+            samples, count = 0, 0
+            for size in lengths:
+                samples += size
+                count += 1
+                if samples >= 8 * SAMPLE_RATE:
+                    break
+            if samples < 8 * SAMPLE_RATE:
+                raise ValueError('Insufficient completed chunks for window rollover')
+            state.audio_accum = state.audio_accum[samples:]
+            state.chunk_text = state.chunk_text[count:]
+            state.chunk_sample_lengths = lengths[count:]
+            state._first_chunk_discarded = True
+
+    def _run_stream_steps(self, steps):
+        """Preserve the synchronous API using the same prepare/apply generator."""
+        try:
+            item, params = next(steps)
+            while True:
+                outputs = self.model.generate([item], sampling_params=params, use_tqdm=False)
+                item, params = steps.send(outputs)
+        except StopIteration as finished:
+            return finished.value
+
+    def streaming_transcribe_no_reset(self, pcm16k, state, max_new_tokens=None,
+                                      rollback_punctuation=False):
+        return self._run_stream_steps(self._streaming_transcribe_steps(
+            pcm16k, state, max_new_tokens, rollback_punctuation))
+
+    def _streaming_transcribe_steps(
         self,
         pcm16k: np.ndarray,
         state: ASRStreamingState,
@@ -647,28 +688,7 @@ class R2T2ASRModel(Qwen3ASRModel):
             chunk = state.buffer[: state.chunk_size_samples]
             state.buffer = state.buffer[state.chunk_size_samples :]
 
-            # Accumulate audio (re-feed from start, no padding)
-            if state.audio_accum.shape[0] == 0:
-                state.audio_accum = chunk
-            else:
-                state.audio_accum = np.concatenate([state.audio_accum, chunk], axis=0)
-            # Once the accumulated audio reaches 16 seconds, discard the earliest 8 seconds and discard the corresponding text
-            max_samples = 16 * SAMPLE_RATE
-            discard_samples = 8 * SAMPLE_RATE
-            if state.audio_accum.shape[0] > max_samples:
-                keep_samples = state.audio_accum.shape[0] - discard_samples
-                # Calculate the exact number of chunks to discard: the first chunk is 320 ms (5,120 samples), and subsequent chunks are 160 ms (2,560 samples)
-                normal_chunk_samples = 2560  # 160ms
-                if not state._first_chunk_discarded:
-                    # First discard: the first chunk is 320 ms
-                    first_chunk_samples = 5120  # 320ms
-                    discard_chunks = 1 + (discard_samples - first_chunk_samples) // normal_chunk_samples  # = 49
-                    state._first_chunk_discarded = True
-                else:
-                    # Subsequent discards: all chunks are 160 ms
-                    discard_chunks = discard_samples // normal_chunk_samples  # = 50
-                state.audio_accum = state.audio_accum[-keep_samples:]
-                state.chunk_text = state.chunk_text[discard_chunks:]
+            self._append_stream_audio(state, chunk)
 
             prefix_text = "".join(state.chunk_text)
             if state.force_language == None and state.language != "":
@@ -679,7 +699,7 @@ class R2T2ASRModel(Qwen3ASRModel):
 
             prompt = state.prompt_raw + prefix
 
-            # vLLM input: single item
+            # Yield one request; the batch worker combines DIFFERENT sessions.
             inp = {"prompt": prompt, "multi_modal_data": {"audio": [state.audio_accum]}}
             if max_new_tokens is not None:
                 sampling_params = SamplingParams(
@@ -687,9 +707,9 @@ class R2T2ASRModel(Qwen3ASRModel):
                     max_tokens=max_new_tokens,
                     skip_special_tokens=True,
                 )
-                outputs = self.model.generate([inp], sampling_params=sampling_params, use_tqdm=False)
+                outputs = yield (inp, sampling_params)
             else:
-                outputs = self.model.generate([inp], sampling_params=self.sampling_params, use_tqdm=False)
+                outputs = yield (inp, self.sampling_params)
             gen_text = outputs[0].outputs[0].text
             # gen_text = gen_text.replace("#","|")
             gen_text = _normalize_punct_by_context(gen_text).replace('\ufffd', '')
@@ -743,6 +763,8 @@ class R2T2ASRModel(Qwen3ASRModel):
             if not has_tag and state.force_language == None:
                 state.text = ""
                 fixed_text = ""
+                state.chunk_text.append("")
+                state.chunk_sample_lengths.append(len(chunk))
                 continue
   
             state.language = lang
@@ -757,12 +779,16 @@ class R2T2ASRModel(Qwen3ASRModel):
                 new_asr_text = ""
             new_asr_text = new_asr_text.split("|")[0]
             state.chunk_text.append(new_asr_text)
+            state.chunk_sample_lengths.append(len(chunk))
             state.last_fixed_text = state.last_fixed_text + new_asr_text
 
 
         return state.text, state.last_fixed_text
 
-    def finish_streaming_transcribe_no_reset(
+    def finish_streaming_transcribe_no_reset(self, state, max_new_tokens=None):
+        return self._run_stream_steps(self._finish_streaming_steps(state, max_new_tokens))
+
+    def _finish_streaming_steps(
         self,
         state: ASRStreamingState,
         max_new_tokens=None,
@@ -812,29 +838,7 @@ class R2T2ASRModel(Qwen3ASRModel):
         tail = state.buffer
         state.buffer = np.zeros((0,), dtype=np.float32)
 
-        # Append tail to accumulated audio
-        if state.audio_accum.shape[0] == 0:
-            state.audio_accum = tail
-        else:
-            state.audio_accum = np.concatenate([state.audio_accum, tail], axis=0)
-
-        # Once the accumulated audio reaches 16 seconds, discard the earliest 8 seconds and discard the corresponding text
-        max_samples = 16 * SAMPLE_RATE
-        discard_samples = 8 * SAMPLE_RATE
-        if state.audio_accum.shape[0] > max_samples:
-            keep_samples = state.audio_accum.shape[0] - discard_samples
-            # Calculate the exact number of chunks to discard: the first chunk is 320 ms (5,120 samples), and subsequent chunks are 160 ms (2,560 samples)
-            normal_chunk_samples = 2560  # 160ms
-            if not state._first_chunk_discarded:
-                # First discard: the first chunk is 320 ms
-                first_chunk_samples = 5120  # 320ms
-                discard_chunks = 1 + (discard_samples - first_chunk_samples) // normal_chunk_samples  # = 49
-                state._first_chunk_discarded = True
-            else:
-                # Subsequent discards: all chunks are 160 ms
-                discard_chunks = discard_samples // normal_chunk_samples  # = 50
-            state.audio_accum = state.audio_accum[-keep_samples:]
-            state.chunk_text = state.chunk_text[discard_chunks:]
+        self._append_stream_audio(state, tail)
 
         prefix_text = "".join(state.chunk_text)
         if state.force_language == None and state.language != "":
@@ -853,9 +857,9 @@ class R2T2ASRModel(Qwen3ASRModel):
                 max_tokens=max_new_tokens,
                 skip_special_tokens=True,
             )
-            outputs = self.model.generate([inp], sampling_params=sampling_params, use_tqdm=False)
+            outputs = yield (inp, sampling_params)
         else:
-            outputs = self.model.generate([inp], sampling_params=self.sampling_params, use_tqdm=False)
+            outputs = yield (inp, self.sampling_params)
         gen_text = outputs[0].outputs[0].text
    
         gen_text = _normalize_punct_by_context(gen_text).replace('\ufffd', '')
@@ -872,6 +876,7 @@ class R2T2ASRModel(Qwen3ASRModel):
         fixed_text_stripped = txt.strip()
         new_asr_text = fixed_text_stripped[len(prefix_stripped):]
         state.chunk_text.append(new_asr_text)
+        state.chunk_sample_lengths.append(len(tail))
         state.last_fixed_text = state.last_fixed_text + new_asr_text
         return state.last_fixed_text
     

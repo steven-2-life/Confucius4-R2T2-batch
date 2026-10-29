@@ -1,3 +1,5 @@
+> This fork adds a dynamic batching WebSocket service. See [batch service setup](BATCHING.md) for startup, configuration and tests.
+
 <div align="center">
     <img src="resources/R2T2_logo.png" alt="Confucius4-R2T2" width="30%">
     <h1>Confucius4-<span style="color: #4F8CFF;">R2T2</span>: A Low Latency and High Accuracy Real-Time Speech Recognition Model</h1>

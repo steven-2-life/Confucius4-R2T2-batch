@@ -434,7 +434,7 @@ async def asr_stream_api_v0(request: Request, ws: Websocket):
                 except asyncio.TimeoutError:
                     logger.info(f"requestId={requestId}: ws.recv() timeout after {RECV_TIMEOUT}s, closing")
                     break
-                await recv_queue.put(data)
+                await recv_queue.put((data, time.perf_counter()))
                 # Exit the receiver after receiving EOS
                 if isinstance(data, str) and data == YOUDAO_ONETIME_ASR_EOS_STRING:
                     break
@@ -531,6 +531,7 @@ async def asr_stream_api_v0(request: Request, ws: Websocket):
             max_new_tokens_floor = min(32, max(4,2 * int(step / 1280)))
             is_first = True
             total_secs = LOOKAHEAD_MS / 1000.0
+            audio_processed_samples = 0
             is_halluc = False
             halluc_reason = ""
             recv_time = 0
@@ -547,6 +548,8 @@ async def asr_stream_api_v0(request: Request, ws: Websocket):
                     _logger.info(f"requestId={requestId}: processor got STOP from receiver, exit")
                     break
 
+                data, queued_at = data
+                input_queue_ms = (time.perf_counter() - queued_at) * 1000
                 recv_time = time.time()
 
                 if isinstance(data, str):
@@ -636,6 +639,7 @@ async def asr_stream_api_v0(request: Request, ws: Websocket):
                         audio_seg, asr_state, int(max_new_tokens), nmt_fast
                     )
                     asr_cost_ms = round((time.time() - t0) * 1000, 1)
+                    audio_processed_samples += len(audio_seg)
                     if len(fixed_asr_text) > len(last_fixed_asr_text):
                         new_asr_text = fixed_asr_text[len(last_fixed_asr_text):]
                         fixed_asr_text = last_fixed_asr_text + new_asr_text
@@ -692,6 +696,8 @@ async def asr_stream_api_v0(request: Request, ws: Websocket):
                         out_msg = {"text": seg_new_asr_text, "reset": True, "asr_cost_ms": asr_cost_ms}
                         last_fixed_asr_text = ""
                     finish_cost_ms = round((time.time() - t0) * 1000, 1)
+                    out_msg['audio_processed_samples'] = audio_processed_samples
+                    out_msg['infer_queue_ms'] = round(input_queue_ms, 3)
                     out_msg['total_cost_ms'] = vad_cost_ms + asr_cost_ms + finish_cost_ms
                     _recent_cost_ms.append(out_msg['total_cost_ms'])
                     if len(_recent_cost_ms) > 10:
@@ -886,7 +892,7 @@ async def asr_stream_api_v1(request: Request, ws: Websocket):
                 except asyncio.TimeoutError:
                     logger.info(f"requestId={requestId}: ws.recv() timeout after {RECV_TIMEOUT}s, closing")
                     break
-                await recv_queue.put(data)
+                await recv_queue.put((data, time.perf_counter()))
                 # Exit the receiver after receiving EOS
                 if isinstance(data, str) and data == YOUDAO_ONETIME_ASR_EOS_STRING:
                     break
@@ -983,6 +989,7 @@ async def asr_stream_api_v1(request: Request, ws: Websocket):
             max_new_tokens_floor = min(32, max(4,2 * int(step / 1280)))
             is_first = True
             total_secs = LOOKAHEAD_MS / 1000.0
+            audio_processed_samples = 0
             is_halluc = False
             halluc_reason = ""
             recv_time = 0
@@ -999,6 +1006,8 @@ async def asr_stream_api_v1(request: Request, ws: Websocket):
                     _logger.info(f"requestId={requestId}: processor got STOP from receiver, exit")
                     break
 
+                data, queued_at = data
+                input_queue_ms = (time.perf_counter() - queued_at) * 1000
                 recv_time = time.time()
 
                 if isinstance(data, str):
@@ -1087,6 +1096,7 @@ async def asr_stream_api_v1(request: Request, ws: Websocket):
                         audio_seg, asr_state, int(max_new_tokens), nmt_fast
                     )
                     asr_cost_ms = round((time.time() - t0) * 1000, 1)
+                    audio_processed_samples += len(audio_seg)
                     if len(fixed_asr_text) > len(last_fixed_asr_text):
                         new_asr_text = fixed_asr_text[len(last_fixed_asr_text):]
                         fixed_asr_text = last_fixed_asr_text + new_asr_text
@@ -1145,6 +1155,8 @@ async def asr_stream_api_v1(request: Request, ws: Websocket):
                         out_msg = {"text": seg_new_asr_text, "reset": True, "asr_cost_ms": asr_cost_ms}
                         last_fixed_asr_text = ""
                     finish_cost_ms = round((time.time() - t0) * 1000, 1)
+                    out_msg['audio_processed_samples'] = audio_processed_samples
+                    out_msg['infer_queue_ms'] = round(input_queue_ms, 3)
                     out_msg['total_cost_ms'] = vad_cost_ms + asr_cost_ms + finish_cost_ms
                     _recent_cost_ms.append(out_msg['total_cost_ms'])
                     if len(_recent_cost_ms) > 10:

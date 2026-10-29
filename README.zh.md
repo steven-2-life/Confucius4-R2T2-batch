@@ -1,3 +1,5 @@
+> 本 fork 增加动态合批 WebSocket 服务，启动、配置和测试见[批处理服务说明](BATCHING.md)。
+
 <div align="center">
     <img src="resources/R2T2_logo.png" alt="Confucius4-R2T2" width="30%">
     <h1>Confucius4-<span style="color: #4F8CFF;">R2T2</span>: A Low Latency and High Accuracy Real-Time Speech Recognition Model</h1>
